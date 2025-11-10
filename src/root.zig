@@ -3,8 +3,10 @@ const std = @import("std");
 const Node = std.SinglyLinkedList.Node;
 const Alignment = std.mem.Alignment;
 
+const log_alloc = std.log.scoped(.allocator);
+
 pub const MAGIC: u32 = 0xAAAAAAAA; //ALLOC0
-const DEFAULT_ALIGN = Alignment.@"16";
+const DEFAULT_ALIGN = Alignment.@"4";
 //includes alignment padding
 const HEADER_SIZE = @sizeOf(Header);
 const DEFAULT_OFFSET = HEADER_SIZE - @sizeOf(Header);
@@ -20,7 +22,6 @@ pub const Header = struct {
     pub fn try_realign(self: *Header, alignment: Alignment) void {
         const offset = self.data_offset();
         const new_offset = self.data_offset_align(alignment);
-        std.log.info("new_offset {} w alignment {}", .{ new_offset, alignment.toByteUnits() });
         if (offset > new_offset) {
             //increase in size because less padding
             if (offset - new_offset > self.size) return;
@@ -56,9 +57,10 @@ pub const Header = struct {
             //account for padding
             self.size += (@intFromPtr(header) - (@intFromPtr(self.data_ptr()) + self.size)) + header.total_size();
             self.node.next = header.node.next;
+            header.magic = 0;
             count += 1;
         }
-        std.log.info("joined {f} {} time(s)", .{ self, count });
+        log_alloc.debug("joined {f} {} time(s)", .{ self, count });
         return count > 0;
     }
     pub fn split(header: *Header, size: usize) void {
@@ -68,21 +70,15 @@ pub const Header = struct {
         if (@intFromPtr(header.data_ptr()) + header.size < @intFromPtr(new_header) + @sizeOf(Header)) return;
         //how far from start of original_header.data
         const new_header_off = @intFromPtr(new_header) - @intFromPtr(header.data_ptr());
-        std.log.info("new header offset 0x{x} @ {*}", .{ new_header_off, new_header });
-        std.log.info("new_header_off({x}) is new_header({*}) - header.data_ptr({*})", .{ new_header_off, new_header, header.data_ptr() });
         const new_size = header.size - new_header_off - @sizeOf(Header);
-        std.log.info("size({x}) is header.size({x}) - new_header_off({x}) - @sizeOf(Header)({})", .{ new_size, header.size, new_header_off, @sizeOf(Header) });
 
         new_header.* = Header{
             .size = new_size,
             .data_align = .@"1",
         };
         new_header.try_realign(DEFAULT_ALIGN);
-        new_header.node.next = header.node.next;
-        header.node.next = &new_header.node;
-        // header.node.insertAfter(&new_header.node);
+        header.node.insertAfter(&new_header.node);
         header.size = size;
-        std.log.info("split | new_header: {f}, old_header: {f}", .{ new_header, header });
     }
     fn data_offset_align(self: *Header, alignment: Alignment) usize {
         _ = self;
@@ -96,7 +92,7 @@ pub const Header = struct {
         return end - new_offset;
     }
     pub fn format(header: *Header, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.print("Block(align({}))({*})({X}){{ free:{}, size:0x{x}, align:{}, data offset:0x{x}/{} }},\n", .{
+        try writer.print("Block(align({}))({*})({X}){{ free:{}, size:0x{x}, align:{}, data offset:0x{x}/{} }}", .{
             @alignOf(Header),
             header,
             header.magic,
@@ -117,28 +113,21 @@ pub const SAlloc = struct {
     const vtable = struct {
         fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            std.log.info("alloc {} | free {}\n", .{ len, self.count_free() });
-            std.log.info("{f}", .{self});
+            log_alloc.debug("alloc {} | free {}\n", .{ len, self.count_free() });
+            log_alloc.debug("prealloc {f}", .{self});
             //find first free big enough
             //and adjust alignment
             var h: ?*Header = self.get_first();
-            std.log.info("self: {*}", .{self});
-            std.log.info("first: {*}", .{h});
-            if (h) |header| {
-                std.log.info("first magic: {x}", .{header.magic});
-            }
             while (h) |header| : (h = header.next()) {
                 if (header.free) {
-                    std.log.info("joining block: {f}", .{header});
-                    // _ = header.join();
-                    std.log.info("magic: {x} size: {}", .{ header.magic, header.size });
+                    _ = header.join();
                     if (header.data_align != alignment) {
                         if (header.data_size_with_alignment(alignment)) |new_size| {
                             if (new_size >= len) {
                                 header.free = false;
                                 header.try_realign(alignment);
                                 header.split(len);
-                                std.log.info("after alloc {f}", .{self});
+                                log_alloc.debug("after alloc ({*}) {f}", .{ header.data_ptr(), self });
                                 return header.data_ptr();
                             }
                         }
@@ -149,13 +138,13 @@ pub const SAlloc = struct {
                         if (header.size >= len) {
                             header.split(len);
                             header.free = false;
-                            std.log.info("after alloc {f}", .{self});
+                            log_alloc.debug("after alloc ({*}) {f}", .{ header.data_ptr(), self });
                             return header.data_ptr();
                         }
                     }
                 }
             }
-            std.log.info("couldn't alloc :<", .{});
+            log_alloc.debug("couldn't alloc :<", .{});
             return null;
         }
         fn remap(
@@ -172,19 +161,27 @@ pub const SAlloc = struct {
             const self: *Self = @ptrCast(@alignCast(ctx));
             const header: *Header = self.header_from_memory(memory).?;
             if (header.magic != MAGIC) {
-                std.log.err("MAGIC doesn't match {}", .{header.magic});
+                log_alloc.err("MAGIC doesn't match {}", .{header.magic});
                 return false;
             }
+            log_alloc.debug("preresize {f}\n", .{self});
             if (memory.len == new_len) return true;
             if (header.next()) |next| {
                 if (new_len > memory.len) {
-                    if (next.free and next.total_size() + header.size >= new_len) {
+                    if (next.free and next.total_size() + (@intFromPtr(next) - @intFromPtr(header.data_ptr())) >= new_len) {
+                        log_alloc.debug("grow to {}\n", .{new_len});
                         const result = header.join();
+                        _ = result;
                         header.split(new_len);
-                        return result;
+                        if (header.size != new_len) {
+                            log_alloc.debug("couldn't resize ig\n", .{});
+                        }
+                        log_alloc.debug("postresize {f}\n", .{self});
+                        return header.size == new_len;
                     }
                 } else {
                     //shrink
+                    log_alloc.debug("shrink to {}\n", .{new_len});
                     //must be able to move next block
                     if (!next.free) return false;
                     const diff = header.size - new_len;
@@ -209,12 +206,12 @@ pub const SAlloc = struct {
             const header: *Header = self.header_from_memory(memory).?;
             header.free = true;
             _ = header.join();
-            std.log.info("free {f}", .{header});
+            log_alloc.debug("free {f}", .{header});
+            log_alloc.debug("postfree {f}\n", .{self});
         }
     };
 
     pub fn header_from_memory(self: *Self, memory: []u8) ?*Header {
-        // const next_headerAlignment.of(Header).forward(@intFromPtr(memory.ptr)+memory.len);
         var header_ptr: ?*Header = self.get_first();
         while (header_ptr) |header| : (header_ptr = header.next()) {
             if (header.data_ptr() == memory.ptr) return header;
@@ -236,7 +233,7 @@ pub const SAlloc = struct {
         try writer.print("SAlloc{{ free:{}, buffer({*}).len:{}\nHeaders:\n", .{ self.count_free(), self.global_buffer.ptr, self.global_buffer.len });
         var h: ?*Header = self.get_first();
         while (h) |header| : (h = header.next()) {
-            try writer.print("\t{f}", .{header});
+            try writer.print("\t{f},\n", .{header});
         }
         try writer.print("}}", .{});
     }
@@ -258,9 +255,7 @@ pub const SAlloc = struct {
             .data_align = .@"1",
             .free = true,
         };
-        std.log.info("before realign: {f}", .{self});
         first.try_realign(DEFAULT_ALIGN);
-        std.log.info("after realign: {f}", .{self});
     }
     pub fn allocator(self: *Self) std.mem.Allocator {
         return self.alloc;
