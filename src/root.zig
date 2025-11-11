@@ -221,11 +221,11 @@ pub const SAlloc = struct {
     fn get_first(self: *Self) *Header {
         return @ptrFromInt(Alignment.of(Header).forward(@intFromPtr(self.global_buffer.ptr)));
     }
-    fn count_free(self: *Self) usize {
+    pub fn count_free(self: *Self) usize {
         var free: usize = 0;
         var h: ?*Header = self.get_first();
         while (h) |header| : (h = header.next()) {
-            if (header.free) free += header.total_size();
+            if (header.free) free += header.size;
         }
         return free;
     }
