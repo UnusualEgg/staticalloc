@@ -10,6 +10,7 @@ const DEFAULT_ALIGN = Alignment.@"4";
 //includes alignment padding
 const HEADER_SIZE = @sizeOf(Header);
 const DEFAULT_OFFSET = HEADER_SIZE - @sizeOf(Header);
+const DataOffset = usize;
 
 pub const Header = struct {
     magic: u32 = MAGIC,
@@ -19,9 +20,9 @@ pub const Header = struct {
     data_align: Alignment,
 
     /// adjusts `alignment` and adjusts `size` to match `alignment`.
-    pub fn try_realign(self: *Header, alignment: Alignment) void {
-        const offset = self.data_offset();
-        const new_offset = self.data_offset_align(alignment);
+    pub fn tryRealign(self: *Header, alignment: Alignment) void {
+        const offset = self.dataOffset();
+        const new_offset = dataOffsetWithAlignment(alignment);
         if (offset > new_offset) {
             //increase in size because less padding
             if (offset - new_offset > self.size) return;
@@ -39,55 +40,82 @@ pub const Header = struct {
             return @fieldParentPtr("node", n);
         } else return null;
     }
-    fn data_ptr(self: *Header) [*]u8 {
-        return @ptrFromInt(@intFromPtr(self) + self.data_offset());
+    fn dataPtr(self: *Header) [*]u8 {
+        return @ptrFromInt(@intFromPtr(self) + self.dataOffset());
     }
     //from start of header
-    fn data_offset(self: *Header) usize {
-        return self.data_align.forward(@sizeOf(Header));
+    //gets the same minimum offset for any pointer alignment possibility
+    fn dataOffset(self: *Header) usize {
+        return self.data_align.forward(@sizeOf(Header) + @sizeOf(DataOffset));
     }
-    fn total_size(self: *Header) usize {
-        return self.data_offset() + self.size;
+    fn dataOffsetWithAlignment(alignment: Alignment) usize {
+        return alignment.forward(@sizeOf(Header) + @sizeOf(DataOffset));
     }
-    pub fn join(self: *Header) bool {
+    fn getHeaderOffset(ptr: [*]u8) *align(1) DataOffset {
+        //intentionally ignore usize alignment
+        return @ptrCast(@intFromPtr(ptr) - @sizeOf(DataOffset));
+    }
+    //includes capacity
+    fn getRealEndAddr(header: *Header, buffer_end_addr: usize) usize {
+        return @intFromPtr(header.next()) orelse buffer_end_addr;
+    }
+    fn totalSize(self: *Header) usize {
+        return self.dataOffset() + self.size;
+    }
+    fn totalCapacity(self: *Header, buffer_end_addr: usize) usize {
+        return self.dataPtr() - self.getRealEndAddr(buffer_end_addr);
+    }
+    pub fn join(self: *Header, buffer_end_addr: usize) bool {
         var ptr: ?*Header = self.next();
         var count: usize = 0;
         while (ptr) |header| : (ptr = header.next()) {
             if (!header.free) break;
-            //account for padding
-            self.size += (@intFromPtr(header) - (@intFromPtr(self.data_ptr()) + self.size)) + header.total_size();
+            const total_capacity = self.getRealEndAddr(buffer_end_addr) - @intFromPtr(self.dataPtr());
+
+            self.size = total_capacity;
             self.node.next = header.node.next;
             header.magic = 0;
-            count += 1;
+            count +|= 1;
         }
         log_alloc.debug("joined {f} {} time(s)", .{ self, count });
         return count > 0;
     }
-    pub fn split(header: *Header, size: usize) void {
+    pub fn split(header: *Header, size: usize, buffer_end_addr: usize, default_alignment: Alignment) void {
         //also end of header data(the old one)
-        const new_header: *Header = @ptrFromInt(Alignment.of(Header).forward(@intFromPtr(header.data_ptr()) + size));
-        //account for alignmentZ
-        if (@intFromPtr(header.data_ptr()) + header.size < @intFromPtr(new_header) + @sizeOf(Header)) return;
-        //how far from start of original_header.data
-        const new_header_off = @intFromPtr(new_header) - @intFromPtr(header.data_ptr());
-        const new_size = header.size - new_header_off - @sizeOf(Header);
+        const new_after_data_addr = @intFromPtr(header.dataPtr()) + size;
+        const new_header: *Header = @ptrFromInt(Alignment.of(Header).forward(new_after_data_addr));
+        const new_header_alignment_bytes = new_after_data_addr - @intFromPtr(new_header);
+
+        const real_end_addr: *u8 = @intFromPtr(header.next()) orelse buffer_end_addr;
+        const total_len = @intFromPtr(real_end_addr) - @intFromPtr(header.dataPtr());
+
+        //account for alignment
+        const new_header_alignment: Alignment = .@"1";
+        //check if we have enough space to split (add a new header in unused bytes)
+        //don't align forward because we only use alignment 1
+        if (real_end_addr - size < @intFromPtr(new_header + 1) + @sizeOf(DataOffset)) return;
+
+        //offset from data
+        const new_size = total_len - (size + new_header_alignment_bytes + @sizeOf(DataOffset));
 
         new_header.* = Header{
             .size = new_size,
-            .data_align = .@"1",
+            .data_align = new_header_alignment,
         };
-        new_header.try_realign(DEFAULT_ALIGN);
+        //use align(1) still
+        getHeaderOffset(new_header.dataPtr()).* = @sizeOf(Header);
+        new_header.tryRealign(default_alignment);
         header.node.insertAfter(&new_header.node);
         header.size = size;
     }
-    fn data_offset_align(self: *Header, alignment: Alignment) usize {
-        _ = self;
-        return alignment.forward(@sizeOf(Header));
+    pub fn fromDataPtr(ptr: [*]u8) *Header {
+        return @ptrFromInt(@intFromPtr(ptr) - getHeaderOffset(ptr).*);
     }
-    fn data_size_with_alignment(self: *Header, alignment: Alignment) ?usize {
-        const offset = self.data_offset();
+
+    fn dataSizeWithAlignment(self: *Header, alignment: Alignment) ?usize {
+        const offset = self.dataOffset();
         const end = offset + self.size;
-        const new_offset = self.data_offset_align(alignment);
+        const new_offset = dataOffsetWithAlignment(alignment);
         if (end < new_offset) return null;
         return end - new_offset;
     }
@@ -99,8 +127,8 @@ pub const Header = struct {
             header.free,
             header.size,
             header.data_align.toByteUnits(),
-            header.data_offset(),
-            header.data_offset(),
+            header.dataOffset(),
+            header.dataOffset(),
         });
     }
 };
@@ -109,42 +137,44 @@ pub const SAlloc = struct {
     const Self = @This();
     global_buffer: []u8,
     alloc: std.mem.Allocator,
+    default_align: Alignment = .@"1",
 
     const vtable = struct {
-        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+        fn alloc(ctx: *anyopaque, requested_size: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            log_alloc.debug("alloc {} | free {}\n", .{ len, self.count_free() });
+            log_alloc.debug("alloc {} | free {}\n", .{ requested_size, self.count_free() });
             log_alloc.debug("prealloc {f}", .{self});
+            const buffer_end_addr = @intFromPtr(self.global_buffer.ptr) + self.global_buffer.len;
             //find first free big enough
             //and adjust alignment
-            var h: ?*Header = self.get_first();
+            var h: ?*Header = self.getFirst();
             while (h) |header| : (h = header.next()) {
                 if (header.free) {
-                    _ = header.join();
+                    _ = header.join(buffer_end_addr);
                     if (header.data_align != alignment) {
-                        if (header.data_size_with_alignment(alignment)) |new_size| {
-                            if (new_size >= len) {
+                        if (header.dataSizeWithAlignment(alignment)) |new_size| {
+                            if (new_size >= requested_size) {
                                 header.free = false;
-                                header.try_realign(alignment);
-                                header.split(len);
-                                log_alloc.debug("after alloc ({*}) {f}", .{ header.data_ptr(), self });
-                                return header.data_ptr();
+                                header.tryRealign(alignment);
+                                header.split(requested_size, buffer_end_addr, self.default_align);
+                                log_alloc.debug("after alloc ({*}) {f}", .{ header.dataPtr(), self });
+                                return header.dataPtr();
                             }
                         }
                         //fails if this block has a small size and align but a big align is requested
                         continue;
                     } else {
                         //equal alignment
-                        if (header.size >= len) {
-                            header.split(len);
+                        if (header.size >= requested_size) {
+                            header.split(requested_size, buffer_end_addr, self.default_align);
                             header.free = false;
-                            log_alloc.debug("after alloc ({*}) {f}", .{ header.data_ptr(), self });
-                            return header.data_ptr();
+                            log_alloc.debug("after alloc ({*}) {f}", .{ header.dataPtr(), self });
+                            return header.dataPtr();
                         }
                     }
                 }
             }
-            log_alloc.debug("couldn't alloc :<", .{});
+            log_alloc.err("couldn't alloc :<", .{});
             return null;
         }
         fn remap(
@@ -164,46 +194,17 @@ pub const SAlloc = struct {
                 log_alloc.err("MAGIC doesn't match {}", .{header.magic});
                 return false;
             }
-            log_alloc.debug("preresize {f}\n", .{self});
             if (memory.len == new_len) return true;
-            if (header.next()) |next| {
-                if (new_len > memory.len) {
-                    if (next.free and next.total_size() + (@intFromPtr(next) - @intFromPtr(header.data_ptr())) >= new_len) {
-                        log_alloc.debug("grow to {}\n", .{new_len});
-                        const result = header.join();
-                        _ = result;
-                        header.split(new_len);
-                        if (header.size != new_len) {
-                            log_alloc.debug("couldn't resize ig\n", .{});
-                        }
-                        log_alloc.debug("postresize {f}\n", .{self});
-                        return header.size == new_len;
-                    }
-                } else {
-                    //shrink
-                    log_alloc.debug("shrink to {}\n", .{new_len});
-                    //must be able to move next block
-                    if (!next.free) return false;
-                    const diff = header.size - new_len;
-                    const offset = next.data_offset();
-                    const old_size = next.size;
-                    const old_next = next.node;
-                    const new_end: *Header = @ptrFromInt(Alignment.of(Header).forward(header.data_offset() + new_len));
-                    new_end.* = Header{
-                        .node = old_next,
-                        .size = diff + offset + old_size,
-                        .data_align = Alignment.@"1", //make calculation easier
-                    };
-                    new_end.try_realign(DEFAULT_ALIGN);
-                    header.node.next = &new_end.node;
-                    return true;
-                }
-            }
-            return false;
+            const buffer_end_addr = @intFromPtr(self.global_buffer.ptr) + self.global_buffer.len;
+            header.join(buffer_end_addr);
+            log_alloc.debug("grow to {}\n", .{new_len});
+            header.split(new_len);
+            log_alloc.debug("shrink to {}\n", .{new_len});
+            return header.size == new_len;
         }
         fn free(ctx: *anyopaque, memory: []u8, _: Alignment, _: usize) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            const header: *Header = self.header_from_memory(memory).?;
+            const header: *Header = Header.fromDataPtr(memory.ptr);
             header.free = true;
             _ = header.join();
             log_alloc.debug("free {f}", .{header});
@@ -211,19 +212,12 @@ pub const SAlloc = struct {
         }
     };
 
-    pub fn header_from_memory(self: *Self, memory: []u8) ?*Header {
-        var header_ptr: ?*Header = self.get_first();
-        while (header_ptr) |header| : (header_ptr = header.next()) {
-            if (header.data_ptr() == memory.ptr) return header;
-        }
-        return null;
-    }
-    fn get_first(self: *Self) *Header {
+    fn getFirst(self: *Self) *Header {
         return @ptrFromInt(Alignment.of(Header).forward(@intFromPtr(self.global_buffer.ptr)));
     }
     pub fn count_free(self: *Self) usize {
         var free: usize = 0;
-        var h: ?*Header = self.get_first();
+        var h: ?*Header = self.getFirst();
         while (h) |header| : (h = header.next()) {
             if (header.free) free += header.size;
         }
@@ -231,7 +225,7 @@ pub const SAlloc = struct {
     }
     pub fn format(self: *Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("SAlloc{{ free:{}, buffer({*}).len:{}\nHeaders:\n", .{ self.count_free(), self.global_buffer.ptr, self.global_buffer.len });
-        var h: ?*Header = self.get_first();
+        var h: ?*Header = self.getFirst();
         while (h) |header| : (h = header.next()) {
             try writer.print("\t{f},\n", .{header});
         }
@@ -247,7 +241,7 @@ pub const SAlloc = struct {
             } },
             .global_buffer = buffer,
         };
-        const first: *Header = self.get_first();
+        const first: *Header = self.getFirst();
         const buffer_end = @intFromPtr(self.global_buffer.ptr) + self.global_buffer.len;
         const size = buffer_end - (@intFromPtr(first) + HEADER_SIZE);
         first.* = Header{
@@ -255,7 +249,7 @@ pub const SAlloc = struct {
             .data_align = .@"1",
             .free = true,
         };
-        first.try_realign(DEFAULT_ALIGN);
+        first.tryRealign(DEFAULT_ALIGN);
     }
     pub fn allocator(self: *Self) std.mem.Allocator {
         return self.alloc;
@@ -355,4 +349,20 @@ test "salloc basic" {
     alloc.free(first);
     try std.testing.expectEqual(12345, third[2]);
     alloc.free(third);
+}
+test "alignment" {
+    // const testing_alloc = std.testing.allocator;
+    // var list: std.ArrayList(*u8) = .empty;
+    // errdefer {
+    //     for (list.items) |ptr| {
+    //         testing_alloc.free(ptr);
+    //     }
+    // }
+
+    // var have_unaligned = false;
+    // const alignment = Alignment.fromByteUnits(@sizeOf(usize));
+    // while (!have_unaligned) {
+    //     const ptr = try testing_alloc.create(u8);
+    //     if (std.mem.isAligned(@intFromPtr(ptr), alignment));
+    // }
 }
