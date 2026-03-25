@@ -19,6 +19,15 @@ pub const Header = struct {
     size: usize,
     data_align: Alignment,
 
+    pub fn init(header: *Header, node: Node, size: usize, alignment: Alignment) void {
+        header.* = Header{
+            .node = node,
+            .size = size,
+            .data_align = alignment,
+        };
+        header.initHeaderOffset();
+    }
+
     /// adjusts `alignment` and adjusts `size` to match `alignment`.
     pub fn tryRealign(self: *Header, alignment: Alignment) void {
         const offset = self.dataOffset();
@@ -54,6 +63,11 @@ pub const Header = struct {
     fn getHeaderOffset(ptr: [*]u8) *align(1) DataOffset {
         //intentionally ignore usize alignment
         return @ptrCast(@intFromPtr(ptr) - @sizeOf(DataOffset));
+    }
+    fn initHeaderOffset(header: *Header) void {
+        const data_ptr = header.dataPtr();
+        const offset_ptr = getHeaderOffset(data_ptr);
+        offset_ptr.* = @intFromPtr(data_ptr) - @intFromPtr(header);
     }
     //includes capacity
     fn getRealEndAddr(header: *Header, buffer_end_addr: usize) usize {
@@ -103,7 +117,7 @@ pub const Header = struct {
             .data_align = new_header_alignment,
         };
         //use align(1) still
-        getHeaderOffset(new_header.dataPtr()).* = @sizeOf(Header);
+        new_header.initHeaderOffset();
         new_header.tryRealign(default_alignment);
         header.node.insertAfter(&new_header.node);
         header.size = size;
