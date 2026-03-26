@@ -5,8 +5,7 @@ const Alignment = std.mem.Alignment;
 
 const alloc_log = std.log.scoped(.allocator);
 
-pub const MAGIC: u32 = 0xAAAAAAAA; //ALLOC0
-const DEFAULT_ALIGN = Alignment.@"4";
+pub const MAGIC: u32 = 0xA770c0; //ALLOC0
 //includes alignment padding
 const HEADER_SIZE = @sizeOf(Header) + @sizeOf(usize);
 const DataOffset = usize;
@@ -289,7 +288,7 @@ pub const SAlloc = struct {
         const buffer_end = @intFromPtr(self.global_buffer.ptr) + self.global_buffer.len;
         const size = buffer_end - (@intFromPtr(first) + HEADER_SIZE);
         first.init(size, .@"1");
-        first.tryRealign(DEFAULT_ALIGN);
+        first.tryRealign(self.default_align);
     }
     pub fn allocator(self: *Self) std.mem.Allocator {
         return self.alloc;
@@ -297,24 +296,42 @@ pub const SAlloc = struct {
 };
 
 test "blocks" {
-    // std.testing.log_level = .debug;
-    std.debug.print("header size is {} or 0x{x} or {} w default alignment\n", .{ @sizeOf(Header), @sizeOf(Header), HEADER_SIZE });
+    std.testing.log_level = .info;
+    std.log.info("header size is {} or 0x{x} or {} with header offset\n", .{ @sizeOf(Header), @sizeOf(Header), HEADER_SIZE });
 
     const alignment = @alignOf(Header);
 
-    var buf: [HEADER_SIZE * 4]u8 align(alignment) = undefined;
-    std.debug.print("size of buf is {0} or 0x{0x}\n", .{buf.len});
-    var s: SAlloc = undefined;
-    s.init(&buf);
-    var expected: [HEADER_SIZE * 4]u8 align(alignment) = undefined;
+    var expected: [HEADER_SIZE * 4]u8 align(alignment) = @splat(0xAB);
     const header1 = @as(*Header, @ptrCast(@alignCast(&expected[0 * (HEADER_SIZE)])));
     const header2 = @as(*Header, @ptrCast(@alignCast(&expected[2 * (HEADER_SIZE)])));
-    header1.init(HEADER_SIZE, alignment);
-    header2.init(HEADER_SIZE, alignment);
+    header1.init(HEADER_SIZE, .@"1");
+    header2.init(HEADER_SIZE, .@"1");
+    header1.node.next = &header2.node;
+    header1.free = false;
+    header2.free = false;
 
+    const data1_bytes: [HEADER_SIZE]u8 = @splat(0xca);
+    const data2_bytes: [HEADER_SIZE]u8 = @splat(0xfe);
+
+    @memcpy(header1.dataPtr()[0..HEADER_SIZE], &data1_bytes);
+    @memcpy(header2.dataPtr()[0..HEADER_SIZE], &data2_bytes);
+
+    var buf: [HEADER_SIZE * 4]u8 align(alignment) = @splat(0xAB);
     var sa: SAlloc = undefined;
     sa.init(&buf);
-    //TODO
+
+    const alloc1 = try sa.alloc.alloc(u8, HEADER_SIZE);
+    const alloc2 = try sa.alloc.alloc(u8, HEADER_SIZE);
+
+    @memcpy(alloc1, &data1_bytes);
+    @memcpy(alloc2, &data2_bytes);
+
+    const alloc_header = Header.fromDataPtr(alloc1.ptr);
+    alloc_header.node = header1.node;
+    std.log.info("header1: {f}", .{header1});
+    std.log.info("header2: {f}", .{header2});
+    std.log.info("header1: {f}", .{alloc_header});
+    std.log.info("header2: {f}", .{Header.fromDataPtr(alloc2.ptr)});
 
     try std.testing.expectEqualSlices(u8, &expected, &buf);
 }
@@ -349,20 +366,4 @@ test "salloc basic" {
     alloc.free(first);
     try std.testing.expectEqual(12345, third[2]);
     alloc.free(third);
-}
-test "alignment" {
-    // const testing_alloc = std.testing.allocator;
-    // var list: std.ArrayList(*u8) = .empty;
-    // errdefer {
-    //     for (list.items) |ptr| {
-    //         testing_alloc.free(ptr);
-    //     }
-    // }
-
-    // var have_unaligned = false;
-    // const alignment = Alignment.fromByteUnits(@sizeOf(usize));
-    // while (!have_unaligned) {
-    //     const ptr = try testing_alloc.create(u8);
-    //     if (std.mem.isAligned(@intFromPtr(ptr), alignment));
-    // }
 }
