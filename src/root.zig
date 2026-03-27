@@ -97,6 +97,7 @@ pub const Header = struct {
             header.magic = 0;
             count +|= 1;
         }
+        self.size = self.totalDataCapacity(buffer_end_addr);
         alloc_log.debug("joined {f} {} time(s)", .{ self, count });
         return count > 0;
     }
