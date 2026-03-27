@@ -290,6 +290,12 @@ pub const SAlloc = struct {
         first.init(size, .@"1");
         first.tryRealign(self.default_align);
     }
+    pub fn initWithFreeMem(self: *Self, T: type, last_global: *const T) void {
+        const global_end = @as([*]u8, @ptrCast(last_global)) + @sizeOf(T);
+        const space_remaining = std.wasm.page_size - @intFromPtr(global_end);
+        const buffer = global_end[0..space_remaining];
+        self.init(buffer);
+    }
     pub fn allocator(self: *Self) std.mem.Allocator {
         return self.alloc;
     }
