@@ -58,13 +58,16 @@ pub const Header = struct {
     fn dataOffsetWithAlignment(alignment: Alignment) usize {
         return alignment.forward(@sizeOf(Header) + @sizeOf(DataOffset));
     }
-    fn getHeaderOffset(ptr: [*]u8) *align(1) DataOffset {
+    fn getHeaderOffsetPtr(ptr: [*]u8) *align(1) DataOffset {
         //intentionally ignore usize alignment
         return @ptrFromInt(@intFromPtr(ptr) - @sizeOf(DataOffset));
     }
+    pub fn getHeaderOffset(ptr: [*]u8) DataOffset {
+        return getHeaderOffsetPtr(ptr).*;
+    }
     fn initHeaderOffset(header: *Header) void {
         const data_ptr = header.dataPtr();
-        const offset_ptr = getHeaderOffset(data_ptr);
+        const offset_ptr = getHeaderOffsetPtr(data_ptr);
         offset_ptr.* = @intFromPtr(data_ptr) - @intFromPtr(header);
     }
     /// gets the capacity end address
@@ -154,7 +157,7 @@ pub const Header = struct {
         }
     }
     pub fn fromDataPtr(ptr: [*]u8) *Header {
-        return @ptrFromInt(@intFromPtr(ptr) - getHeaderOffset(ptr).*);
+        return @ptrFromInt(@intFromPtr(ptr) - getHeaderOffset(ptr));
     }
 
     fn dataSizeWithAlignment(self: *Header, alignment: Alignment) ?usize {
@@ -303,10 +306,17 @@ pub const SAlloc = struct {
 test "blocks" {
     std.testing.log_level = .info;
     std.log.info("header size is {} or 0x{x} or {} with header offset\n", .{ @sizeOf(Header), @sizeOf(Header), HEADER_SIZE });
+    var header_len: usize = 0;
+    inline for (@typeInfo(Header).@"struct".fields) |field| {
+        const offset = @offsetOf(Header, field.name);
+        std.log.info("{s}: [{}-{})", .{ field.name, offset, offset + @sizeOf(field.type) });
+        header_len = @max(header_len, offset + @sizeOf(field.type));
+    }
+    std.log.info("Alignment size: {}", .{@bitSizeOf(Alignment)});
 
     const alignment = @alignOf(Header);
 
-    var expected: [HEADER_SIZE * 4]u8 align(alignment) = @splat(0xAB);
+    var expected: [HEADER_SIZE * 4]u8 align(alignment) = undefined;
     const header1 = @as(*Header, @ptrCast(@alignCast(&expected[0 * (HEADER_SIZE)])));
     const header2 = @as(*Header, @ptrCast(@alignCast(&expected[2 * (HEADER_SIZE)])));
     header1.init(HEADER_SIZE, .@"1");
@@ -315,24 +325,42 @@ test "blocks" {
     header1.free = false;
     header2.free = false;
 
+    try std.testing.expectEqual(header1.dataOffset(), @intFromPtr(header1.dataPtr()) - @intFromPtr(header1));
+
+    try std.testing.expectEqual(header1, Header.fromDataPtr(header1.dataPtr()));
+
     const data1_bytes: [HEADER_SIZE]u8 = @splat(0xca);
     const data2_bytes: [HEADER_SIZE]u8 = @splat(0xfe);
 
     @memcpy(header1.dataPtr()[0..HEADER_SIZE], &data1_bytes);
     @memcpy(header2.dataPtr()[0..HEADER_SIZE], &data2_bytes);
 
-    var buf: [HEADER_SIZE * 4]u8 align(alignment) = @splat(0xAB);
+    var buf: [HEADER_SIZE * 4]u8 align(alignment) = expected;
     var sa: SAlloc = undefined;
     sa.init(&buf);
 
-    const alloc1 = try sa.alloc.alloc(u8, HEADER_SIZE);
-    const alloc2 = try sa.alloc.alloc(u8, HEADER_SIZE);
+    const alloc = sa.allocator();
+    const alloc1 = try alloc.alloc(u8, HEADER_SIZE);
+    const alloc2 = try alloc.alloc(u8, HEADER_SIZE);
 
     @memcpy(alloc1, &data1_bytes);
     @memcpy(alloc2, &data2_bytes);
 
     const alloc_header = Header.fromDataPtr(alloc1.ptr);
     alloc_header.node = header1.node;
+
+    {
+        //there can be extra padding after a non-packed struct for alignment
+        const padding_len = @sizeOf(Header) - header_len;
+
+        std.log.info("padding_len: {}", .{padding_len});
+
+        @memset(@as([*]u8, @ptrCast(header1))[header_len..][0..padding_len], 0);
+        @memset(@as([*]u8, @ptrCast(alloc_header))[header_len..][0..padding_len], 0);
+        @memset(@as([*]u8, @ptrCast(Header.fromDataPtr(alloc2.ptr)))[header_len..][0..padding_len], 0);
+    }
+
+    std.log.info("header1: {}, alloc1: {}", .{ Header.getHeaderOffset(header1.dataPtr()), Header.getHeaderOffset(alloc_header.dataPtr()) });
     std.log.info("header1: {f}", .{header1});
     std.log.info("header2: {f}", .{header2});
     std.log.info("header1: {f}", .{alloc_header});
@@ -350,7 +378,7 @@ test "salloc1" {
     var buf: [1024]u8 = undefined;
     var s: SAlloc = undefined;
     s.init(&buf);
-    const alloc = s.alloc;
+    const alloc = s.allocator();
     const first = try alloc.alloc(u8, 2);
     alloc.free(first);
 }
@@ -358,7 +386,7 @@ test "salloc basic" {
     var buf: [1024]u8 = undefined;
     var s: SAlloc = undefined;
     s.init(&buf);
-    const alloc = s.alloc;
+    const alloc = s.allocator();
     const first = try alloc.alloc(u8, 2);
     first[0] = 0xde;
     first[1] = 0xad;
