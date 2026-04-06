@@ -181,7 +181,6 @@ pub const Header = struct {
 pub const SAlloc = struct {
     const Self = @This();
     global_buffer: []u8,
-    alloc: std.mem.Allocator,
     default_align: Alignment = .@"1",
 
     const vtable = struct {
@@ -277,12 +276,6 @@ pub const SAlloc = struct {
     }
     pub fn init(self: *Self, buffer: []u8) void {
         self.* = Self{
-            .alloc = .{ .ptr = self, .vtable = &std.mem.Allocator.VTable{
-                .alloc = vtable.alloc,
-                .free = vtable.free,
-                .remap = vtable.remap,
-                .resize = vtable.resize,
-            } },
             .global_buffer = buffer,
         };
         const first: *Header = self.getFirst();
@@ -298,7 +291,12 @@ pub const SAlloc = struct {
         self.init(buffer);
     }
     pub fn allocator(self: *Self) std.mem.Allocator {
-        return self.alloc;
+        return .{ .ptr = self, .vtable = &std.mem.Allocator.VTable{
+            .alloc = vtable.alloc,
+            .free = vtable.free,
+            .remap = vtable.remap,
+            .resize = vtable.resize,
+        } };
     }
 };
 
