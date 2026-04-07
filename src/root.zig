@@ -6,8 +6,10 @@ const Alignment = std.mem.Alignment;
 const alloc_log = std.log.scoped(.allocator);
 
 pub const MAGIC: u32 = 0xA770c0; //ALLOC0
-//includes alignment padding
-const HEADER_SIZE = @sizeOf(Header) + @sizeOf(usize);
+/// The size of a `Header` and the `DataOffset` before the data.
+const HEADER_SIZE = @sizeOf(Header) + @sizeOf(DataOffset);
+/// `dataPtr - DataOffset = Header`. This goes right before the data.
+/// There may be alignment padding between this and the `Header`.
 const DataOffset = usize;
 
 pub const Header = struct {
@@ -27,16 +29,19 @@ pub const Header = struct {
 
     /// adjusts `alignment` and adjusts `size` to match `alignment`.
     pub fn tryRealign(self: *Header, alignment: Alignment) void {
+        // this includes `HEADER_SIZE`
         const offset = self.dataOffset();
-        const new_offset = dataOffsetWithAlignment(alignment);
+        const new_offset = self.dataOffsetWithAlignment(alignment);
         if (offset > new_offset) {
             //increase in size because less padding
-            if (offset - new_offset > self.size) return;
-            self.size += offset - new_offset;
+            const new_size = offset - new_offset;
+            if (new_size > self.size) return;
+            self.size += new_size;
         } else {
             //decrease in size because more padding
-            if (new_offset - offset > self.size) return;
-            self.size -= new_offset - offset;
+            const new_size = new_offset - offset;
+            if (new_size > self.size) return;
+            self.size -= new_size;
         }
         self.data_align = alignment;
         self.initHeaderOffset();
@@ -53,10 +58,13 @@ pub const Header = struct {
     }
     /// gets the data offset from start of header
     fn dataOffset(self: *Header) usize {
-        return self.data_align.forward(@sizeOf(Header) + @sizeOf(DataOffset));
+        const self_addr = @intFromPtr(self);
+        return self.data_align.forward(self_addr + @sizeOf(Header) + @sizeOf(DataOffset)) - self_addr;
     }
-    fn dataOffsetWithAlignment(alignment: Alignment) usize {
-        return alignment.forward(@sizeOf(Header) + @sizeOf(DataOffset));
+
+    fn dataOffsetWithAlignment(self: *Header, alignment: Alignment) usize {
+        const self_addr = @intFromPtr(self);
+        return alignment.forward(self_addr + @sizeOf(Header) + @sizeOf(DataOffset)) - self_addr;
     }
     fn getHeaderOffsetPtr(ptr: [*]u8) *align(1) DataOffset {
         //intentionally ignore usize alignment
@@ -163,7 +171,7 @@ pub const Header = struct {
     fn dataSizeWithAlignment(self: *Header, alignment: Alignment) ?usize {
         const offset = self.dataOffset();
         const end = offset + self.size;
-        const new_offset = dataOffsetWithAlignment(alignment);
+        const new_offset = self.dataOffsetWithAlignment(alignment);
         if (end < new_offset) return null;
         return end - new_offset;
     }
@@ -287,9 +295,9 @@ pub const SAlloc = struct {
         first.init(size, .@"1");
         first.tryRealign(self.default_align);
     }
-    pub fn initWithFreeMem(self: *Self, T: type, last_global: *const T) void {
+    pub fn initWithFreeMem(self: *Self, T: type, last_global: *const T, total_mem_size: usize) void {
         const global_end = @as([*]u8, @ptrCast(@constCast(last_global))) + @sizeOf(T);
-        const space_remaining = std.wasm.page_size - @intFromPtr(global_end);
+        const space_remaining = total_mem_size - @intFromPtr(global_end);
         const buffer = global_end[0..space_remaining];
         self.init(buffer);
     }
@@ -303,7 +311,7 @@ pub const SAlloc = struct {
     }
 };
 
-test "blocks" {
+test "byte accuracy" {
     std.testing.log_level = .info;
     std.log.info("header size is {} or 0x{x} or {} with header offset\n", .{ @sizeOf(Header), @sizeOf(Header), HEADER_SIZE });
     var header_len: usize = 0;
@@ -369,7 +377,7 @@ test "blocks" {
     try std.testing.expectEqualSlices(u8, &expected, &buf);
 }
 
-test "salloc" {
+test "basic init" {
     var buf: [1024]u8 = undefined;
     var s: SAlloc = undefined;
     s.init(&buf);
